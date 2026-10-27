@@ -1,0 +1,4 @@
+# Collector needs no Python packages. These are for the dashboard and UI tests.
+streamlit>=1.66,<2
+plotly>=6,<7
+pandas>=2.2,<3

@@ -1,0 +1,24 @@
+# Merge into ~/.ssh/config. Replace jump host and usernames with actual values.
+Host NMS3_Infra
+    HostName nms3.example.invalid
+    User YOUR_JUMP_USER
+    IdentityFile ~/.ssh/id_ed25519
+    BatchMode yes
+    StrictHostKeyChecking yes
+
+Host bpl-he-40-72
+    HostName 10.113.40.72
+    User root
+    ProxyJump NMS3_Infra
+    IdentityFile ~/.ssh/id_ed25519
+
+Host bpl-he-40-73
+    HostName 10.113.40.73
+    User root
+    ProxyJump NMS3_Infra
+    IdentityFile ~/.ssh/id_ed25519
+
+# Put shared defaults after specific Host blocks.
+Host bpl-he-*
+    BatchMode yes
+    StrictHostKeyChecking yes

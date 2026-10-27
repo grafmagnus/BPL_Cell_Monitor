@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.sqlite3*
+*.collector.lock
+config.json
+coordinates.csv
+demo-data/

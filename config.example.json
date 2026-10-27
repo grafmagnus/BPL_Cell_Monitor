@@ -1,0 +1,16 @@
+{
+  "database": "data/bpl.sqlite3",
+  "coordinates": "coordinates.csv",
+  "interval_seconds": 300,
+  "retention_days": 56,
+  "timeout_seconds": 35,
+  "connect_timeout_seconds": 10,
+  "retries": 1,
+  "retry_delay_seconds": 2,
+  "workers": 4,
+  "max_age": null,
+  "headends": [
+    {"name": "HE-40-72", "ssh_host": "bpl-he-40-72"},
+    {"name": "HE-40-73", "ssh_host": "bpl-he-40-73"}
+  ]
+}

@@ -3,14 +3,16 @@
   "coordinates": "coordinates.csv",
   "interval_seconds": 300,
   "retention_days": 56,
-  "timeout_seconds": 35,
+  "timeout_seconds": 25,
   "connect_timeout_seconds": 10,
   "retries": 1,
   "retry_delay_seconds": 2,
-  "workers": 4,
+  "workers": 32,
   "max_age": null,
-  "headends": [
-    {"name": "HE-40-72", "ssh_host": "bpl-he-40-72"},
-    {"name": "HE-40-73", "ssh_host": "bpl-he-40-73"}
-  ]
+  "jumphost": "NMS3_Infra",
+  "ssh_user": "root",
+  "dns_server": "10.40.8.117",
+  "dns_port": 53,
+  "dns_timeout_seconds": 5,
+  "headends_csv": "headends.csv"
 }

@@ -1,12 +1,14 @@
-"""BPL polling, parsing and SQLite storage. Python 3.11+, standard library only."""
+"""BPL polling, DNS discovery and SQLite storage. Python 3.11+."""
 from __future__ import annotations
 
 import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import csv
 from dataclasses import dataclass, field
 import json
+import ipaddress
 import logging
 import math
 import os
@@ -67,7 +69,8 @@ def load_config(path):
     cfg = json.loads(path.read_text(encoding="utf-8-sig"))
     for key, default in {"interval_seconds": 300, "retention_days": 56,
                          "timeout_seconds": 35, "connect_timeout_seconds": 10,
-                         "retries": 1, "retry_delay_seconds": 2, "workers": 4}.items():
+                         "retries": 1, "retry_delay_seconds": 2, "workers": 4,
+                         "dns_timeout_seconds": 5, "dns_port": 53}.items():
         cfg.setdefault(key, default)
         if type(cfg[key]) is not int or cfg[key] < (0 if key in {"retries", "retry_delay_seconds"} else 1):
             raise ValueError(f"Invalid {key}")
@@ -78,6 +81,22 @@ def load_config(path):
         raise ValueError("max_age must be null or a nonnegative integer")
     cfg["database"] = str((path.parent / cfg.get("database", "data/bpl.sqlite3")).resolve())
     cfg["coordinates"] = str((path.parent / cfg.get("coordinates", "coordinates.csv")).resolve())
+    cfg.setdefault("jumphost", "NMS3_Infra")
+    jump = cfg["jumphost"]
+    if jump is not None and (not isinstance(jump, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]*", jump)):
+        raise ValueError("jumphost must be an SSH alias or user@host[:port], or null")
+    cfg.setdefault("dns_server", "10.40.8.117")
+    cfg["dns_server"] = str(ipaddress.ip_address(cfg["dns_server"]))
+    if cfg["dns_port"] > 65535:
+        raise ValueError("dns_port out of range")
+    cfg.setdefault("ssh_user", "root")
+    if not isinstance(cfg["ssh_user"], str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", cfg["ssh_user"]):
+        raise ValueError("Invalid ssh_user")
+    if cfg.get("headends_csv"):
+        if cfg.get("headends"):
+            raise ValueError("Choose headends_csv or a manual headends list, not both")
+        cfg["headends_csv"] = str((path.parent / cfg["headends_csv"]).resolve())
+        cfg["headends"] = load_headends(cfg["headends_csv"], cfg["ssh_user"])
     names, destinations = set(), set()
     if not cfg.get("headends"):
         raise ValueError("At least one headend is required")
@@ -89,9 +108,63 @@ def load_config(path):
             raise ValueError("ssh_host must be a host alias, address, or user@host")
         if destination in destinations:
             raise ValueError("Duplicate ssh_host; do not poll the same alias twice")
+        if headend.get("ssh_user") is not None and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", headend["ssh_user"]):
+            raise ValueError("Invalid headend ssh_user")
+        if headend.get("dns_name") and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", headend["dns_name"]):
+            raise ValueError("Invalid headend dns_name")
         names.add(name)
         destinations.add(destination)
     return cfg
+
+
+def load_headends(path, ssh_user="root"):
+    """HE rows only; validate hostname against MAC, never use CSV IP for routing."""
+    result, seen = [], set()
+    with Path(path).open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter=";")
+        if not {"identification", "deviceUniqueIdAnchor", "unitType"}.issubset(reader.fieldnames or []):
+            raise ValueError("Headend CSV requires identification;deviceUniqueIdAnchor;unitType")
+        for line, row in enumerate(reader, 2):
+            if (row.get("unitType") or "").strip().upper() != "HE":
+                continue
+            mac = normalize_mac(row["deviceUniqueIdAnchor"])
+            hostname = row["identification"].strip().lower()
+            expected = mac.replace(":", "") + ".eui"
+            if hostname != expected:
+                raise ValueError(f"Headend CSV line {line}: hostname {hostname!r} does not match MAC {mac}")
+            if hostname in seen:
+                raise ValueError(f"Duplicate headend in CSV: {hostname}")
+            seen.add(hostname)
+            result.append({"name": hostname, "ssh_host": hostname, "dns_name": hostname,
+                           "ssh_user": ssh_user, "mac": mac,
+                           "label": row.get("deviceName", ""),
+                           "csv_reference_ip": row.get("deviceWanIpAddress", "")})
+    if not result:
+        raise ValueError("No unitType=HE rows found in headend CSV")
+    return result
+
+
+def resolve_headend(hostname, cfg):
+    """Explicit resolver; no system search domain or CSV-IP fallback."""
+    try:
+        import dns.exception
+        import dns.resolver
+    except ImportError as exc:
+        raise RuntimeError("DNS discovery requires: python -m pip install -r requirements-collector.txt") from exc
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = [cfg["dns_server"]]
+    resolver.port = cfg["dns_port"]
+    resolver.timeout = cfg["dns_timeout_seconds"]
+    resolver.lifetime = cfg["dns_timeout_seconds"]
+    try:
+        answer = resolver.resolve(hostname.rstrip(".") + ".", "A", search=False,
+                                  lifetime=cfg["dns_timeout_seconds"])
+        addresses = sorted({str(ipaddress.IPv4Address(record.address)) for record in answer}, key=ipaddress.IPv4Address)
+    except (dns.exception.DNSException, OSError, ValueError) as exc:
+        raise RuntimeError(f"DNS {hostname} via {cfg['dns_server']}: {type(exc).__name__}: {exc}") from exc
+    if len(addresses) != 1:
+        raise RuntimeError(f"DNS {hostname}: expected one distinct A record, got {addresses}")
+    return addresses[0]
 
 
 SCHEMA = """
@@ -102,7 +175,8 @@ CREATE TABLE IF NOT EXISTS polls (
  cycle_id INTEGER NOT NULL REFERENCES cycles(id) ON DELETE CASCADE,
  headend TEXT NOT NULL, status TEXT NOT NULL, observed_at REAL NOT NULL,
  attempts INTEGER NOT NULL, error TEXT, row_count INTEGER NOT NULL,
- duplicate_count INTEGER NOT NULL, PRIMARY KEY(cycle_id,headend));
+ duplicate_count INTEGER NOT NULL, dns_name TEXT, resolved_ip TEXT,
+ PRIMARY KEY(cycle_id,headend));
 CREATE TABLE IF NOT EXISTS devices (mac TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS observations (
  cycle_id INTEGER NOT NULL, headend TEXT NOT NULL, mac TEXT NOT NULL,
@@ -128,11 +202,16 @@ def open_database(path):
     db.execute("PRAGMA foreign_keys=ON")
     db.execute("PRAGMA journal_mode=WAL")
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1):
+    if version not in (0, 1, 2):
         db.close()
         raise ValueError(f"Unsupported database schema {version}")
     db.executescript(SCHEMA)
-    db.execute("PRAGMA user_version=1")
+    with db:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(polls)")}
+        for name in ("dns_name", "resolved_ip"):
+            if name not in columns:
+                db.execute(f"ALTER TABLE polls ADD COLUMN {name} TEXT")
+        db.execute("PRAGMA user_version=2")
     return db
 
 
@@ -180,14 +259,29 @@ class Poll:
     units: list[Unit] = field(default_factory=list)
     attempts: int = 1
     error: str | None = None
+    dns_name: str | None = None
+    resolved_ip: str | None = None
 
 
-def ssh_output(destination, cfg):
+def ssh_command(destination, cfg, resolved_ip=None, ssh_user=None):
     # OpenSSH itself reads ~/.ssh/config, including ProxyJump, keys and aliases.
     command = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
                "-o", f"ConnectTimeout={cfg['connect_timeout_seconds']}",
                "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=10",
-               "-o", "ServerAliveCountMax=2", destination, "ppcdinfo unittable"]
+               "-o", "ServerAliveCountMax=2"]
+    if cfg.get("jumphost"):
+        command += ["-J", cfg["jumphost"]]
+    if ssh_user:
+        command += ["-l", ssh_user]
+    if resolved_ip:
+        # Keep the .eui name for SSH config and known_hosts; route via DNS IP.
+        command += ["-o", f"HostName={ipaddress.IPv4Address(resolved_ip)}",
+                    "-o", f"HostKeyAlias={destination}", "-o", "CanonicalizeHostname=no"]
+    return command + [destination, "ppcdinfo unittable"]
+
+
+def ssh_output(destination, cfg, resolved_ip=None, ssh_user=None):
+    command = ssh_command(destination, cfg, resolved_ip, ssh_user)
     options = {"start_new_session": True} if os.name != "nt" else {
         "creationflags": subprocess.CREATE_NO_WINDOW}
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -211,16 +305,23 @@ def ssh_output(destination, cfg):
 
 def poll_headend(headend, cfg):
     error = ""
+    hostname = headend.get("dns_name")
+    resolved_ip = None
     for attempt in range(1, cfg["retries"] + 2):
         try:
-            units = parse_unittable(ssh_output(headend["ssh_host"], cfg))
-            return Poll(headend["name"], "ok", time.time(), units, attempt)
+            resolved_ip = None
+            if hostname:
+                resolved_ip = resolve_headend(hostname, cfg)
+            units = parse_unittable(ssh_output(headend["ssh_host"], cfg, resolved_ip, headend.get("ssh_user")))
+            return Poll(headend["name"], "ok", time.time(), units, attempt,
+                        dns_name=hostname, resolved_ip=resolved_ip)
         except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
             error = f"{type(exc).__name__}: {exc}"[:2400]
             LOG.warning("%s attempt %d: %s", headend["name"], attempt, error)
             if attempt <= cfg["retries"]:
                 time.sleep(cfg["retry_delay_seconds"])
-    return Poll(headend["name"], "error", time.time(), attempts=attempt, error=error)
+    return Poll(headend["name"], "error", time.time(), attempts=attempt, error=error,
+                dns_name=hostname, resolved_ip=resolved_ip)
 
 
 def store_cycle(db, polls, cfg, started_at=None, finished_at=None):
@@ -241,9 +342,10 @@ def store_cycle(db, polls, cfg, started_at=None, finished_at=None):
                 addresses[(unit.cell, unit.unit_id)].add(unit.mac)
             collisions.update(mac for macs in addresses.values() if len(macs) > 1 for mac in macs)
             duplicates = sum(len(ages)-1 for ages in groups.values())
-            db.execute("INSERT INTO polls VALUES(?,?,?,?,?,?,?,?)", (
+            db.execute("""INSERT INTO polls(cycle_id,headend,status,observed_at,attempts,error,
+                       row_count,duplicate_count,dns_name,resolved_ip) VALUES(?,?,?,?,?,?,?,?,?,?)""", (
                 cycle, poll.headend, poll.status, poll.observed_at, poll.attempts,
-                poll.error, sum(map(len, groups.values())), duplicates))
+                poll.error, sum(map(len, groups.values())), duplicates, poll.dns_name, poll.resolved_ip))
             for (mac, cell, unit_id), ages in groups.items():
                 age = min(ages)
                 db.execute("INSERT OR IGNORE INTO devices VALUES(?)", (mac,))
@@ -285,9 +387,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--once", action="store_true", help="Single round; exit 2 on partial/failing round")
+    parser.add_argument("--list-headends", action="store_true", help="List selected targets without DNS or SSH")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config(args.config)
+    if args.list_headends:
+        print(f"{len(cfg['headends'])} headends; jumphost={cfg['jumphost']}; DNS={cfg['dns_server']}")
+        for headend in cfg["headends"]:
+            print(f"{headend['name']}\t{headend.get('mac', '')}\t{headend.get('label', '')}")
+        return 0
     with collector_lock(cfg["database"]):
         db = open_database(cfg["database"])
         try:

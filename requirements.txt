@@ -1,4 +1,5 @@
-# Collector needs no Python packages. These are for the dashboard and UI tests.
+# Collector DNS support plus dashboard and UI tests.
+-r requirements-collector.txt
 streamlit>=1.66,<2
 plotly>=6,<7
 pandas>=2.2,<3

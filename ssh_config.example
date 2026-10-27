@@ -1,4 +1,5 @@
-# Merge into ~/.ssh/config. Replace jump host and usernames with actual values.
+# Merge only required entries into ~/.ssh/config.
+# If NMS3_Infra already exists, keep the actual existing jump-host settings.
 Host NMS3_Infra
     HostName nms3.example.invalid
     User YOUR_JUMP_USER
@@ -6,19 +7,12 @@ Host NMS3_Infra
     BatchMode yes
     StrictHostKeyChecking yes
 
-Host bpl-he-40-72
-    HostName 10.113.40.72
+# Targets retain their .eui name for this Host block and known_hosts.
+# The collector supplies the freshly resolved DNS IP using -o HostName=IP.
+Host *.eui
     User root
-    ProxyJump NMS3_Infra
     IdentityFile ~/.ssh/id_ed25519
-
-Host bpl-he-40-73
-    HostName 10.113.40.73
-    User root
-    ProxyJump NMS3_Infra
-    IdentityFile ~/.ssh/id_ed25519
-
-# Put shared defaults after specific Host blocks.
-Host bpl-he-*
     BatchMode yes
     StrictHostKeyChecking yes
+
+# Collector supplies -J NMS3_Infra, configurable in JSON.

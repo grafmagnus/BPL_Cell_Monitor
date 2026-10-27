@@ -1,6 +1,35 @@
-# BPL Cell Monitor
+# BPL Headend Monitor
 
-Python 3.11 oder neuer und der OpenSSH-Client. Der Collector benötigt ausschließlich die Python-Standardbibliothek. Streamlit, Plotly und Pandas werden nur für das Dashboard benötigt. Es werden keine Geräte verändert; abgefragt wird ausschließlich `ppcdinfo unittable`.
+Python 3.11 oder neuer und der OpenSSH-Client. Der Collector benötigt für die DNS-Auflösung `dnspython` (`requirements-collector.txt`). Streamlit, Plotly und Pandas werden nur für das Dashboard benötigt. `requirements.txt` installiert alles zusammen. Es werden keine Geräte verändert; abgefragt wird ausschließlich `ppcdinfo unittable`.
+
+## Headends aus CSV, DNS und Jumphost
+
+`headends.csv` ist eine unveränderte Kopie von `6ae1104c53f2a32580d02f24.csv`. Von 3.663 Geräten werden ausschließlich die **126 Zeilen mit `unitType=HE`** abgefragt; 3.534 RP, zwei LEAF und eine Zeile ohne Typ werden ausgelassen. Der genannte Beispielhost `002518053bb8.eui` ist in dieser Datei ein **RP**, kein HE.
+
+Die Konfiguration verwendet folgende Vorgaben:
+
+```json
+{
+  "headends_csv": "headends.csv",
+  "jumphost": "NMS3_Infra",
+  "ssh_user": "root",
+  "dns_server": "10.40.8.117",
+  "dns_port": 53,
+  "dns_timeout_seconds": 5
+}
+```
+
+Alle Parameter stehen in `config.example.json`. Die CSV wird beim Programmstart geladen. `identification` muss der MAC aus `deviceUniqueIdAnchor` entsprechen: etwa `002518047a06.eui` zu `00:25:18:04:7a:06`. Headends werden unter diesem stabilen Hostnamen gespeichert, unabhängig von IP- oder Gerätenamenänderungen. Widersprüchliche oder doppelte HE-Einträge verhindern den Start.
+
+Vor jedem SSH-Versuch wird der absolute `.eui.`-Name als IPv4-A-Record ausschließlich über den eingestellten DNS-Server abgefragt. Es gibt keinen Rückgriff auf den Systemresolver oder `deviceWanIpAddress`. Die CSV-IP ist nur eine Inventarreferenz. Ohne Antwort, bei Timeout oder bei mehreren unterschiedlichen A-Records gilt die Abfrage als fehlgeschlagen und wird entsprechend der Retry-Konfiguration wiederholt. DNS wird auch beim Retry erneut abgefragt. Der DNS-Server muss vom Collector-Rechner erreichbar sein, gegebenenfalls über VPN; DNS-Abfragen laufen direkt vom Collector, SSH läuft über den Jumphost.
+
+OpenSSH erhält `-J NMS3_Infra`, `-l root`, `-o HostName=<DNS-IP>` und `-o HostKeyAlias=<hostname.eui>`. So bleibt der Hostname für `~/.ssh/config` und `known_hosts` stabil, während die Verbindung über den Jumphost zur aktuell ermittelten IP geht. Der Jump-Alias wird weiterhin aus der vorhandenen SSH-Konfiguration gelesen. Hostschlüssel müssen für die `.eui`-Namen geprüft und hinterlegt sein; bereits nur unter einer IP hinterlegte Schlüssel reichen bei dieser Namensbindung nicht aus. `jumphost: null` lässt die ProxyJump-Einstellung aus der SSH-Konfiguration gelten.
+
+`polls.dns_name` und `polls.resolved_ip` dokumentieren Name und tatsächlich verwendete IP je Abfrage und sind im Headend-Status des Dashboards sichtbar. Bestehende Datenbanken werden beim Collectorstart automatisch von Schema 1 auf Schema 2 ergänzt; alte Daten bleiben erhalten. Die neuen `.eui`-Headendnamen ersetzen keine früher manuell gewählten Namen in alten Messungen. Ein solcher Wechsel der Benennung kann in Vergleichen als Headendwechsel erscheinen.
+
+Das mitgelieferte Beispiel nutzt für 126 Headends 32 parallele Abfragen und 25 Sekunden SSH-Zeitlimit. Mit fünf Sekunden DNS-Limit, einem Retry und zwei Sekunden Retrypause benötigt eine komplett fehlschlagende Runde rechnerisch etwa vier Gruppen à 62 Sekunden zuzüglich Prozess-/Speicheraufwand. Das passt typischerweise ins Fünfminutenraster; tatsächliche Überläufe werden protokolliert und Startplätze übersprungen. Bei Bedarf Last und Zeitlimits für eure Infrastruktur anpassen.
+
+Alternativ bleibt eine manuelle `headends`-Liste möglich, sofern `headends_csv` entfernt wird. Einträge mit `dns_name` nutzen den konfigurierten DNS-Server; ohne `dns_name` bleibt die Auflösung beim OpenSSH-Alias. CSV-Liste und manuelle Liste dürfen nicht gleichzeitig gesetzt sein.
 
 ## Enthaltenes Geräteinventar
 
@@ -40,18 +69,17 @@ python -m pip install -r requirements.txt
 cp config.example.json config.json
 ```
 
-1. `ssh_config.example` mit den echten Jump-Host-Daten in die bestehende `~/.ssh/config` übernehmen. Die Beispieldatei ersetzt die bestehende Konfiguration nicht. Unter Windows liegt die Datei normalerweise in `%USERPROFILE%\.ssh\config`.
-2. Die Host-Aliase in `config.json` anpassen. `HE-40-73` ist ein zweites Beispiel; entfernen, wenn nicht vorhanden. Einen physischen Headend nur einmal konfigurieren. `name` bleibt über die Zeit stabil; `ssh_host` darf ein OpenSSH-Alias oder `root@10.113.40.72` sein.
+1. Den bestehenden Jump-Alias `NMS3_Infra` in `~/.ssh/config` verwenden. Falls nötig, `ssh_config.example` mit echten Zugangsdaten ergänzen; die Beispieldatei ersetzt keine bestehende Konfiguration. Unter Windows liegt die Datei normalerweise in `%USERPROFILE%\.ssh\config`.
+2. In `config.json` Jumphost und DNS prüfen. `headends_csv` verweist bereits auf die mitgelieferte CSV; die 126 HE werden automatisch ausgewählt. Auswahl ohne Netzverbindung prüfen: `python monitor.py --config config.json --list-headends`.
 3. Schlüsselzugriff und geprüfte Hostschlüssel für Jump-Host und Headends unter demselben Benutzer einrichten, der den Collector ausführt. Falls ein Agent benötigt wird, muss er auch im Dienstkontext verfügbar sein. Das Beispiel verlangt BatchMode und strikte Hostschlüsselprüfung für den Jump-Host. Der Collector erzwingt diese Optionen für das Ziel.
 4. Die enthaltene `coordinates.csv` mit den echten Inventardaten verwenden. Für weitere Geräte kann sie ergänzt oder durch einen neuen Export ersetzt werden. Spalten im normalisierten Format: `mac,latitude,longitude,label`; `label` ist optional.
-5. Verbindung und einen Durchlauf prüfen:
+5. Den DNS-Server vom Collector-Rechner aus erreichbar machen und einen Durchlauf prüfen:
 
 ```text
-ssh bpl-he-40-72 ppcdinfo unittable
 python monitor.py --config config.json --once
 ```
 
-Der Alias entspricht dem gelieferten Aufruf `ssh -J NMS3_Infra root@10.113.40.72 ppcdinfo unittable`, wobei `ProxyJump NMS3_Infra` im Host-Block steht. OpenSSH liest die Konfiguration selbst; das Skript implementiert keinen eigenen SSH-Konfigurationsparser.
+Das entspricht dem gelieferten SSH-Aufruf mit `-J`, jedoch mit frisch ermittelter DNS-IP und stabiler `.eui`-Hostidentität. OpenSSH liest die SSH-Konfiguration selbst; das Skript implementiert keinen eigenen SSH-Konfigurationsparser.
 
 Collector dauerhaft starten:
 
@@ -92,7 +120,13 @@ Alle relativen Datenpfade werden relativ zur JSON-Konfiguration aufgelöst, nich
 | `retry_delay_seconds` | 2 | Wartezeit zwischen Versuchen |
 | `workers` | 4 | Parallel abgefragte Headends, maximal 64 |
 | `max_age` | `null` | Optionaler maximaler Rohwert der Spalte `age` |
-| `headends` | erforderlich | Liste aus stabilem `name` und `ssh_host` |
+| `headends` | alternativ | Manuelle Liste aus stabilem `name` und `ssh_host`; nicht zusammen mit `headends_csv` |
+| `headends_csv` | im Beispiel `headends.csv` | Semikolon-Export; ausschließlich HE-Zeilen, alternativ zur manuellen Liste |
+| `jumphost` | `NMS3_Infra` | SSH-Jump-Alias; `null` verwendet die SSH-Konfiguration |
+| `ssh_user` | `root` | Zielbenutzer für die HE aus der CSV |
+| `dns_server` | `10.40.8.117` | Ausschließlich verwendeter DNS-Server bei DNS-Zielen |
+| `dns_port` | 53 | DNS-Port |
+| `dns_timeout_seconds` | 5 | DNS-Gesamtzeitlimit je Versuch, zusätzlich zum SSH-Zeitlimit |
 
 Die Einheit und Bedeutung von `age` sind aus dem Beispiel nicht zuverlässig ableitbar. Deshalb wird der Wert unverändert gespeichert; standardmäßig werden keine Zeilen wegen `age` ausgeschlossen. Einen Grenzwert erst nach Prüfung der Firmware-Semantik setzen. Ein kleinerer Wert wird bei Duplikaten als frischere Beobachtung behandelt, sofern diese Filterung aktiviert ist.
 
@@ -141,7 +175,7 @@ Speicherbedarf grob vorab prüfen: pro Woche entstehen je Gerät 2.016 Zustände
 
 ## Tests
 
-Collector ohne zusätzliche Pakete testen:
+Parser, Speicherung und SSH-Retry mit synthetischen Antworten testen:
 
 ```text
 python -m unittest -v test_monitor.py
@@ -150,13 +184,15 @@ python -m unittest -v test_monitor.py
 Nach Installation der Dashboardpakete:
 
 ```text
-python -m unittest -v test_monitor.py test_analytics.py test_dashboard.py
+python -m unittest -v test_monitor.py test_analytics.py test_dashboard.py test_discovery.py
 ```
 
-Validiert mit Python 3.11, Streamlit 1.66.1, Plotly 6.9.0 und Pandas 2.3.3: 27 Tests erfolgreich. `requirements-tested.txt` hält zusätzlich die vollständigen Paketversionen dieses Testlaufs fest; für die gleiche Umgebung kann es statt `requirements.txt` installiert werden. Die Streamlit-Tests prüfen die Ausführung und Widgets; ein browserseitiger Kachelabruf ist darin nicht enthalten.
+Validiert mit Python 3.11, Streamlit 1.66.1, Plotly 6.9.0 und Pandas 2.3.3: 35 Tests erfolgreich. `requirements-tested.txt` hält zusätzlich die vollständigen Paketversionen dieses Testlaufs fest; für die gleiche Umgebung kann es statt `requirements.txt` installiert werden. Die Streamlit-Tests prüfen die Ausführung und Widgets; ein browserseitiger Kachelabruf ist darin nicht enthalten.
 
-Die Tests verwenden temporäre Datenbanken und synthetische SSH-Ergebnisse. Ein echter Netztest ist mit `--once` in der Zielumgebung nötig. Es werden keine Passwörter in der JSON-Datei gespeichert.
+Die Tests verwenden temporäre Datenbanken und synthetische SSH-Ergebnisse. DNS- und SSH-Verbindungen sind in den Tests simuliert; ein echter Netztest ist mit `--once` in der Zielumgebung nötig. Es werden keine Passwörter in der JSON-Datei gespeichert.
 
 ## Referenzen
 
 Die SSH-Weiterleitung folgt der [OpenSSH-Konfiguration einschließlich ProxyJump](https://man.openbsd.org/ssh_config). Das Dashboard verwendet [Streamlit-Fragmente mit periodischer Aktualisierung](https://docs.streamlit.io/develop/api-reference/execution-flow/st.fragment) und [Plotly-Karten mit `scatter_map`](https://plotly.com/python/tile-scatter-maps/).
+
+Die explizite DNS-Auflösung nutzt den [dnspython-Resolver mit konfiguriertem Nameserver und Zeitlimit](https://dnspython.readthedocs.io/en/stable/resolver-class.html). SSH verwendet die [OpenSSH-Optionen für Jump-Host und Zielparameter](https://man.openbsd.org/ssh).

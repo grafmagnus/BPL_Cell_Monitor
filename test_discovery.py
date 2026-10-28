@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import dns.resolver
 
-from monitor import (Poll, load_config, load_headends, open_database, poll_headend,
+from monitor import (ConnectionStartLimiter, Poll, load_config, load_headends, open_database, poll_headend,
                      resolve_headend, ssh_command, store_cycle)
 
 HOST = "002518047a06.eui"
@@ -100,6 +100,45 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT dns_name,resolved_ip FROM polls").fetchone(), (HOST, "10.1.1.2"))
         finally:
             db.close()
+
+    def test_connection_starts_are_spaced(self):
+        clock = [10.0]
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch("monitor.time.monotonic", side_effect=lambda: clock[0]), patch("monitor.time.sleep", side_effect=sleep) as wait:
+            limiter = ConnectionStartLimiter(1)
+            limiter.wait()
+            limiter.wait()
+            limiter.wait()
+        self.assertEqual([c.args[0] for c in wait.call_args_list], [1.0, 1.0])
+
+    def test_retry_backoff_and_limiter_apply_to_each_attempt(self):
+        self.cfg.update(retries=2, retry_delay_seconds=5)
+        from unittest.mock import Mock
+        limiter = Mock()
+        with patch("monitor.resolve_headend", return_value="10.1.1.1"), patch(
+                "monitor.ssh_output", side_effect=[RuntimeError("kex closed"), RuntimeError("kex closed"), HEADER]), patch(
+                "monitor.time.sleep") as wait, patch("monitor.random.uniform", return_value=0.5):
+            result = poll_headend(self.cfg["headends"][0], self.cfg, limiter)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(limiter.wait.call_count, 3)
+        self.assertEqual([c.args[0] for c in wait.call_args_list], [5.5, 10.5])
+
+    def test_invalid_start_intervals(self):
+        for value in [-1, 61, True, "1"]:
+            self.config.write_text(json.dumps({"headends_csv": "devices.csv", "ssh_start_interval_seconds": value}))
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                load_config(self.config)
+
+    def test_single_headend_uses_isolated_diagnostic_database(self):
+        from monitor import main
+        with patch("sys.argv", ["monitor.py", "--config", str(self.config), "--headend", HOST, "--once"]), patch(
+                "monitor.collect_once", return_value=True) as collect:
+            self.assertEqual(main(), 0)
+        config = collect.call_args.args[1]
+        self.assertEqual(len(config["headends"]), 1)
+        self.assertTrue(config["database"].endswith("bpl.diagnostic.sqlite3"))
+        self.assertFalse((self.root / "data" / "bpl.sqlite3").exists())
 
     def test_v1_database_migrates_without_losing_poll(self):
         path = self.root / "old.db"

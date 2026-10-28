@@ -1,6 +1,56 @@
 # BPL Headend Monitor
 
-Python 3.11 oder neuer und der OpenSSH-Client. Der Collector benötigt für die DNS-Auflösung `dnspython` (`requirements-collector.txt`). Streamlit, Plotly und Pandas werden nur für das Dashboard benötigt. `requirements.txt` installiert alles zusammen. Es werden keine Geräte verändert; abgefragt wird ausschließlich `ppcdinfo unittable`.
+Python 3.11 oder neuer und der OpenSSH-Client. Der Collector verwendet `dnspython` sowie für gespeicherte Passwörter `keyring` und `paramiko` (`requirements-collector.txt`). Streamlit, Plotly und Pandas werden nur für das Dashboard benötigt. `requirements.txt` installiert alles zusammen. Es werden keine Geräte verändert; abgefragt wird ausschließlich `ppcdinfo unittable`.
+
+## Headend-Passwort geschützt speichern
+
+Das neue Konfigurationsbeispiel enthält:
+
+```json
+"headend_auth": "keyring",
+"credential_service": "bpl-monitor/headends",
+"ssh_user": "root"
+```
+
+Diese Werte auch in eine bereits vorhandene `config.json` übernehmen. Ohne `headend_auth` bleibt aus Kompatibilitätsgründen die bisherige Schlüsselanmeldung aktiv (`"headend_auth": "key"`). Keine Felder `password` oder `headend_password` in die Konfiguration eintragen; diese werden abgelehnt.
+
+Nach Installation der Pakete einmalig **im interaktiven Terminal unter demselben Betriebssystemkonto wie der Collector** ausführen:
+
+```text
+python -m pip install -r requirements-collector.txt
+python credentials.py set --config config.json
+```
+
+Das Passwort wird zweimal verdeckt abgefragt. Der Eintrag `root@*` gilt für alle Headends. Ein abweichendes Passwort nur für ein bestimmtes Gerät:
+
+```text
+python credentials.py set --config config.json --headend 00251805c198.eui
+```
+
+Der spezifische Eintrag `root@00251805c198.eui` hat Vorrang vor dem gemeinsamen Passwort. `--username` erlaubt einen anderen Kontonamen, der auch mit dem verwendeten `ssh_user` übereinstimmen muss. Ein gesetztes gerätespezifisches Passwort wird bei einem Anmeldefehler nicht durch einen Versuch mit dem gemeinsamen Passwort ersetzt.
+
+Prüfen, ohne das Passwort anzuzeigen:
+
+```text
+python credentials.py status --config config.json
+python credentials.py status --config config.json --headend 00251805c198.eui
+```
+
+Ändern: denselben `set`-Befehl erneut ausführen und den Collector neu starten. Entfernen: `python credentials.py delete --config config.json`, gegebenenfalls mit `--headend`. `status` prüft den exakt bezeichneten Eintrag, nicht dessen Fallback. Der laufende Collector hält geladene Passwörter im Arbeitsspeicher; Änderungen am Speicher werden nach Neustart geladen.
+
+Unterstützt sind native Windows-Anmeldeinformationen, macOS-Schlüsselbund und die Linux-Backends Secret Service/KWallet. Drittanbieter-, Datei-Klartext- und leere Fallback-Backends werden abgelehnt. Das Passwort wird weder in JSON, SQLite, CSV noch in Kommandozeilen oder Umgebungsvariablen abgelegt. Die konkrete Verschlüsselung und Zugriffssteuerung übernimmt der Betriebssystemspeicher. Unter Linux muss der verwendete Schlüsselbund entsprechend geschützt eingerichtet und entsperrt sein. Ein gesperrter oder fehlender Speicher führt zu einer Fehlermeldung, nicht zu einer unsicheren Ersatzdatei. Prozesse mit denselben Kontorechten können je nach System und Schlüsselbundberechtigungen ebenfalls Zugriff erhalten.
+
+**Dauerbetrieb:** Windows-Aufgabenplanung und Collector müssen unter dem Konto laufen, in dessen Anmeldeinformationsspeicher das Passwort abgelegt wurde. Unter Linux benötigt ein Secret-Service-/KWallet-Speicher eine erreichbare Benutzersitzung, häufig einschließlich D-Bus und entsperrtem Schlüsselbund. Ein reiner systemd-Systemdienst unter `bplmon` hat diese Voraussetzungen nicht automatisch. Das Dienstbeispiel daher nur nutzen, wenn der native Speicher im Dienstkontext eingerichtet und erreichbar ist; andernfalls weiter Schlüsselanmeldung verwenden oder zunächst einen passenden Betriebssystemspeicher bereitstellen. Das Passwort wird nicht mit dem ZIP ausgeliefert und muss auf jedem Zielsystem unter dem richtigen Benutzer eingerichtet werden.
+
+**SSH-Verbindung:** In `keyring`-Betriebsart authentifiziert Paramiko ausschließlich den Headend per Passwort. Zum Jumphost öffnet der native OpenSSH-Client den Tunnel mit den bisherigen SSH-Konfigurations- und Schlüssel-/Agent-Einstellungen. Ein zusätzliches Jumphost-Passwort wird damit nicht gespeichert. Zielport, HostKeyAlias und bekannte Hostschlüssel werden aus `ssh -G` und den konfigurierten `known_hosts`-Dateien übernommen. Unbekannte oder geänderte Hostschlüssel werden abgelehnt. Eigene ProxyCommand-Skripte, Hostzertifikate und spezielle OpenSSH-Authentifizierungs-/Algorithmusvorgaben werden vom Passworttransport nicht vollständig nachgebildet; vorgesehen sind der normale ProxyJump-Pfad und bekannte Standard-Hostschlüssel. SSH-Kommandos und Fehlertexte im Passwortpfad enthalten keine Bibliotheks-Fehlerdetails, die versehentlich Geheimnisse offenlegen könnten.
+
+Einzeltest nach der Einrichtung:
+
+```text
+python monitor.py --config config.json --headend 00251805c198.eui --once
+```
+
+Referenzen: [native Speicher und API von keyring](https://keyring.readthedocs.io/en/latest/) sowie [Paramiko-Passwortanmeldung und Hostschlüsselprüfung](https://docs.paramiko.org/en/stable/api/client.html).
 
 ## Headends aus CSV, DNS und Jumphost
 
@@ -27,7 +77,35 @@ OpenSSH erhält `-J NMS3_Infra`, `-l root`, `-o HostName=<DNS-IP>` und `-o HostK
 
 `polls.dns_name` und `polls.resolved_ip` dokumentieren Name und tatsächlich verwendete IP je Abfrage und sind im Headend-Status des Dashboards sichtbar. Bestehende Datenbanken werden beim Collectorstart automatisch von Schema 1 auf Schema 2 ergänzt; alte Daten bleiben erhalten. Die neuen `.eui`-Headendnamen ersetzen keine früher manuell gewählten Namen in alten Messungen. Ein solcher Wechsel der Benennung kann in Vergleichen als Headendwechsel erscheinen.
 
-Das mitgelieferte Beispiel nutzt für 126 Headends 32 parallele Abfragen und 25 Sekunden SSH-Zeitlimit. Mit fünf Sekunden DNS-Limit, einem Retry und zwei Sekunden Retrypause benötigt eine komplett fehlschlagende Runde rechnerisch etwa vier Gruppen à 62 Sekunden zuzüglich Prozess-/Speicheraufwand. Das passt typischerweise ins Fünfminutenraster; tatsächliche Überläufe werden protokolliert und Startplätze übersprungen. Bei Bedarf Last und Zeitlimits für eure Infrastruktur anpassen.
+Das mitgelieferte Beispiel nutzt vier parallele Abfragen, mindestens eine Sekunde zwischen SSH-Verbindungsstarts und 25 Sekunden SSH-Zeitlimit. Dies ersetzt die frühere, für einen einzelnen Jumphost zu aggressive Vorgabe von 32 Verbindungen. Jeder SSH-Retry durchläuft dieselbe Startbegrenzung. Retrypausen steigen exponentiell von der konfigurierten Basis bis 30 Sekunden plus bis zu einer Sekunde Zufallsversatz. Bei vielen langsamen/ausgefallenen Headends kann ein Durchlauf damit länger als fünf Minuten dauern; Überläufe werden protokolliert und Startplätze übersprungen. Das Intervall bleibt ein Zielabstand, keine garantierte Maximaldauer bei Ausfällen.
+
+### SSH-Abbruch vor der Anmeldung (`kex_exchange_identification`)
+
+Ein Abbruch mit `Connection closed by remote host` beweist weder einen falschen Schlüssel noch eine bestimmte Servereinstellung. Die vorherigen 32 parallelen Verbindungen können ein Verbindungs-/Anmeldelimit des Jumphosts ausgelöst haben; auch eine falsche Jump-Adresse, Serverrichtlinien oder ein Netzwerkgerät kommen infrage. OpenSSH kann zusätzliche Verbindungen über [MaxStartups](https://man.openbsd.org/sshd_config#MaxStartups) bereits vor der Anmeldung ablehnen.
+
+Bei bestehender Installation die folgenden Werte in der eigenen `config.json` ändern; das Ersetzen von `config.example.json` allein ändert keine vorhandene Konfiguration:
+
+```json
+"workers": 4,
+"ssh_start_interval_seconds": 1,
+"retry_delay_seconds": 5
+```
+
+Den laufenden Collector beenden und zunächst ein Headend mit dem aktualisierten Skript einzeln prüfen:
+
+```text
+python monitor.py --config config.json --headend 00251805c198.eui --once
+```
+
+Der Einzeltest verwendet eine getrennte Datenbank `bpl.diagnostic.sqlite3` im selben Verzeichnis wie die reguläre Datenbank. So verändert eine eingeschränkte Testabfrage keine Zustände der gesamten Flotte. Ohne `--headend` wird wieder die normale Datenbank verwendet.
+
+Die effektive Jumphost-Konfiguration lässt sich ohne SSH-Verbindung anzeigen:
+
+```text
+ssh -G NMS3_Infra
+```
+
+Im Ergebnis insbesondere `hostname`, `user`, `port` und etwaige weitere Proxy-Einstellungen prüfen. `10.40.8.117` ist als DNS-Server vorgegeben; das macht diese IP nicht automatisch zum richtigen SSH-Jumphost. Sie kann aber absichtlich beide Aufgaben erfüllen. Ein einzelner manueller Versuch mit `ssh -vvv NMS3_Infra` zeigt, ob bereits die Verbindung zum Jumphost scheitert. Wenn der Einzeltest funktioniert und der Flottenlauf scheitert, die Parallelität weiter auf eins reduzieren und die SSH-Serverlogs auf abgewiesene Verbindungsstarts prüfen.
 
 Alternativ bleibt eine manuelle `headends`-Liste möglich, sofern `headends_csv` entfernt wird. Einträge mit `dns_name` nutzen den konfigurierten DNS-Server; ohne `dns_name` bleibt die Auflösung beim OpenSSH-Alias. CSV-Liste und manuelle Liste dürfen nicht gleichzeitig gesetzt sein.
 
@@ -71,7 +149,7 @@ cp config.example.json config.json
 
 1. Den bestehenden Jump-Alias `NMS3_Infra` in `~/.ssh/config` verwenden. Falls nötig, `ssh_config.example` mit echten Zugangsdaten ergänzen; die Beispieldatei ersetzt keine bestehende Konfiguration. Unter Windows liegt die Datei normalerweise in `%USERPROFILE%\.ssh\config`.
 2. In `config.json` Jumphost und DNS prüfen. `headends_csv` verweist bereits auf die mitgelieferte CSV; die 126 HE werden automatisch ausgewählt. Auswahl ohne Netzverbindung prüfen: `python monitor.py --config config.json --list-headends`.
-3. Schlüsselzugriff und geprüfte Hostschlüssel für Jump-Host und Headends unter demselben Benutzer einrichten, der den Collector ausführt. Falls ein Agent benötigt wird, muss er auch im Dienstkontext verfügbar sein. Das Beispiel verlangt BatchMode und strikte Hostschlüsselprüfung für den Jump-Host. Der Collector erzwingt diese Optionen für das Ziel.
+3. Schlüssel-/Agentzugriff auf den Jump-Host und geprüfte Hostschlüssel für Jump-Host und Headends unter demselben Benutzer einrichten, der den Collector ausführt. Das Headend-Passwort wie oben beschrieben einmalig mit `credentials.py set` hinterlegen. Bei `headend_auth=key` stattdessen auch den Schlüsselzugriff auf die Headends einrichten. Falls ein Agent benötigt wird, muss er auch im Dienstkontext verfügbar sein.
 4. Die enthaltene `coordinates.csv` mit den echten Inventardaten verwenden. Für weitere Geräte kann sie ergänzt oder durch einen neuen Export ersetzt werden. Spalten im normalisierten Format: `mac,latitude,longitude,label`; `label` ist optional.
 5. Den DNS-Server vom Collector-Rechner aus erreichbar machen und einen Durchlauf prüfen:
 
@@ -117,13 +195,16 @@ Alle relativen Datenpfade werden relativ zur JSON-Konfiguration aufgelöst, nich
 | `timeout_seconds` | 35 | Gesamtlaufzeitlimit je SSH-Versuch inklusive Jump-Host |
 | `connect_timeout_seconds` | 10 | Zusätzliches Verbindungszeitlimit für das Ziel |
 | `retries` | 1 | Weitere Versuche nach einem Fehler, maximal 5 |
-| `retry_delay_seconds` | 2 | Wartezeit zwischen Versuchen |
+| `retry_delay_seconds` | 2; Beispiel 5 | Basis für exponentielle Retrypause mit Zufallsversatz |
 | `workers` | 4 | Parallel abgefragte Headends, maximal 64 |
+| `ssh_start_interval_seconds` | 1 | Mindestabstand der SSH-Starts je Durchlauf, einschließlich Retries; 0 deaktiviert die Staffelung |
 | `max_age` | `null` | Optionaler maximaler Rohwert der Spalte `age` |
 | `headends` | alternativ | Manuelle Liste aus stabilem `name` und `ssh_host`; nicht zusammen mit `headends_csv` |
 | `headends_csv` | im Beispiel `headends.csv` | Semikolon-Export; ausschließlich HE-Zeilen, alternativ zur manuellen Liste |
 | `jumphost` | `NMS3_Infra` | SSH-Jump-Alias; `null` verwendet die SSH-Konfiguration |
 | `ssh_user` | `root` | Zielbenutzer für die HE aus der CSV |
+| `headend_auth` | `key`; Beispiel `keyring` | OpenSSH-Schlüsselanmeldung oder Passwort aus dem nativen Betriebssystemspeicher |
+| `credential_service` | `bpl-monitor/headends` | Namensraum im Betriebssystemspeicher, kein Passwort |
 | `dns_server` | `10.40.8.117` | Ausschließlich verwendeter DNS-Server bei DNS-Zielen |
 | `dns_port` | 53 | DNS-Port |
 | `dns_timeout_seconds` | 5 | DNS-Gesamtzeitlimit je Versuch, zusätzlich zum SSH-Zeitlimit |
@@ -184,12 +265,12 @@ python -m unittest -v test_monitor.py
 Nach Installation der Dashboardpakete:
 
 ```text
-python -m unittest -v test_monitor.py test_analytics.py test_dashboard.py test_discovery.py
+python -m unittest -v test_monitor.py test_analytics.py test_dashboard.py test_discovery.py test_password_auth.py
 ```
 
-Validiert mit Python 3.11, Streamlit 1.66.1, Plotly 6.9.0 und Pandas 2.3.3: 35 Tests erfolgreich. `requirements-tested.txt` hält zusätzlich die vollständigen Paketversionen dieses Testlaufs fest; für die gleiche Umgebung kann es statt `requirements.txt` installiert werden. Die Streamlit-Tests prüfen die Ausführung und Widgets; ein browserseitiger Kachelabruf ist darin nicht enthalten.
+Validiert mit Python 3.11, Streamlit 1.66.1, Plotly 6.9.0 und Pandas 2.3.3 sowie Paramiko 4.0.0 und keyring 25.7.0: 53 Tests erfolgreich. `requirements-tested.txt` hält zusätzlich die vollständigen Paketversionen dieses Testlaufs fest; für die gleiche Umgebung kann es statt `requirements.txt` installiert werden. Die Streamlit-Tests prüfen die Ausführung und Widgets; ein browserseitiger Kachelabruf ist darin nicht enthalten.
 
-Die Tests verwenden temporäre Datenbanken und synthetische SSH-Ergebnisse. DNS- und SSH-Verbindungen sind in den Tests simuliert; ein echter Netztest ist mit `--once` in der Zielumgebung nötig. Es werden keine Passwörter in der JSON-Datei gespeichert.
+Die Tests verwenden temporäre Datenbanken und synthetische SSH-Ergebnisse. DNS und entfernte Headends werden simuliert; die Passwortanmeldung wird zusätzlich mit einem echten lokalen SSH-Handshake über ein Socketpaar und einen generierten Hostschlüssel geprüft. Der echte Betriebssystem-Passwortspeicher wird in den Tests nicht beschrieben; ein echter Netztest ist mit `--once` in der Zielumgebung nötig. Es werden keine Passwörter in der JSON-Datei gespeichert.
 
 ## Referenzen
 

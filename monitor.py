@@ -14,9 +14,11 @@ import math
 import os
 from pathlib import Path
 import re
+import random
 import signal
 import sqlite3
 import subprocess
+import threading
 import time
 
 LOG = logging.getLogger("bpl")
@@ -76,6 +78,10 @@ def load_config(path):
             raise ValueError(f"Invalid {key}")
     if cfg["retries"] > 5 or cfg["workers"] > 64:
         raise ValueError("retries <= 5 and workers <= 64 required")
+    cfg.setdefault("ssh_start_interval_seconds", 1.0)
+    interval = cfg["ssh_start_interval_seconds"]
+    if type(interval) not in (int, float) or not math.isfinite(interval) or not 0 <= interval <= 60:
+        raise ValueError("ssh_start_interval_seconds must be between 0 and 60")
     cfg.setdefault("max_age", None)
     if cfg["max_age"] is not None and (type(cfg["max_age"]) is not int or cfg["max_age"] < 0):
         raise ValueError("max_age must be null or a nonnegative integer")
@@ -90,6 +96,14 @@ def load_config(path):
     if cfg["dns_port"] > 65535:
         raise ValueError("dns_port out of range")
     cfg.setdefault("ssh_user", "root")
+    cfg.setdefault("headend_auth", "key")
+    cfg.setdefault("credential_service", "bpl-monitor/headends")
+    if cfg["headend_auth"] not in ("key", "keyring"):
+        raise ValueError("headend_auth must be key or keyring")
+    if not isinstance(cfg["credential_service"], str) or not 1 <= len(cfg["credential_service"]) <= 200:
+        raise ValueError("Invalid credential_service")
+    if "password" in cfg or "headend_password" in cfg:
+        raise ValueError("Do not put passwords in config; use credentials.py")
     if not isinstance(cfg["ssh_user"], str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", cfg["ssh_user"]):
         raise ValueError("Invalid ssh_user")
     if cfg.get("headends_csv"):
@@ -101,6 +115,8 @@ def load_config(path):
     if not cfg.get("headends"):
         raise ValueError("At least one headend is required")
     for headend in cfg["headends"]:
+        if "password" in headend:
+            raise ValueError("Do not put headend passwords in config; use credentials.py")
         name, destination = headend["name"], headend["ssh_host"]
         if not isinstance(name, str) or not name or name in names:
             raise ValueError("Headend names must be nonempty and unique")
@@ -281,6 +297,9 @@ def ssh_command(destination, cfg, resolved_ip=None, ssh_user=None):
 
 
 def ssh_output(destination, cfg, resolved_ip=None, ssh_user=None):
+    if cfg.get("headend_auth") == "keyring":
+        from password_auth import password_ssh_output
+        return password_ssh_output(destination, cfg, resolved_ip, ssh_user or cfg["ssh_user"])
     command = ssh_command(destination, cfg, resolved_ip, ssh_user)
     options = {"start_new_session": True} if os.name != "nt" else {
         "creationflags": subprocess.CREATE_NO_WINDOW}
@@ -303,7 +322,22 @@ def ssh_output(destination, cfg, resolved_ip=None, ssh_user=None):
         return stdout.decode("utf-8", "strict")
 
 
-def poll_headend(headend, cfg):
+class ConnectionStartLimiter:
+    """One shared start-rate gate per round, including retry attempts."""
+    def __init__(self, interval):
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.next_start = 0.0
+
+    def wait(self):
+        with self.lock:
+            delay = max(0, self.next_start - time.monotonic())
+            if delay:
+                time.sleep(delay)
+            self.next_start = time.monotonic() + self.interval
+
+
+def poll_headend(headend, cfg, start_limiter=None):
     error = ""
     hostname = headend.get("dns_name")
     resolved_ip = None
@@ -312,6 +346,8 @@ def poll_headend(headend, cfg):
             resolved_ip = None
             if hostname:
                 resolved_ip = resolve_headend(hostname, cfg)
+            if start_limiter is not None:
+                start_limiter.wait()
             units = parse_unittable(ssh_output(headend["ssh_host"], cfg, resolved_ip, headend.get("ssh_user")))
             return Poll(headend["name"], "ok", time.time(), units, attempt,
                         dns_name=hostname, resolved_ip=resolved_ip)
@@ -319,7 +355,11 @@ def poll_headend(headend, cfg):
             error = f"{type(exc).__name__}: {exc}"[:2400]
             LOG.warning("%s attempt %d: %s", headend["name"], attempt, error)
             if attempt <= cfg["retries"]:
-                time.sleep(cfg["retry_delay_seconds"])
+                base = cfg["retry_delay_seconds"]
+                delay = min(30, base * 2 ** (attempt-1))
+                if base:
+                    delay += random.uniform(0, 1)
+                time.sleep(delay)
     return Poll(headend["name"], "error", time.time(), attempts=attempt, error=error,
                 dns_name=hostname, resolved_ip=resolved_ip)
 
@@ -376,8 +416,9 @@ def store_cycle(db, polls, cfg, started_at=None, finished_at=None):
 
 def collect_once(db, cfg):
     started = time.time()
+    limiter = ConnectionStartLimiter(cfg.get("ssh_start_interval_seconds", 1.0))
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as executor:
-        polls = list(executor.map(lambda h: poll_headend(h, cfg), cfg["headends"]))
+        polls = list(executor.map(lambda h: poll_headend(h, cfg, limiter), cfg["headends"]))
     cycle = store_cycle(db, polls, cfg, started)
     LOG.info("Round %d: %d/%d headends successful", cycle, sum(p.status == "ok" for p in polls), len(polls))
     return all(p.status == "ok" for p in polls)
@@ -388,14 +429,30 @@ def main():
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--once", action="store_true", help="Single round; exit 2 on partial/failing round")
     parser.add_argument("--list-headends", action="store_true", help="List selected targets without DNS or SSH")
+    parser.add_argument("--headend", help="Only poll this configured name/hostname (diagnostic scope)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config(args.config)
+    if args.headend:
+        selected = [h for h in cfg["headends"] if args.headend.lower() in
+                    (h["name"].lower(), h["ssh_host"].lower())]
+        if not selected:
+            parser.error(f"Headend not found: {args.headend}")
+        cfg["headends"] = selected
+        # A diagnostic subset must not produce 'missing' states for the full fleet.
+        diagnostic = Path(cfg["database"])
+        cfg["database"] = str(diagnostic.with_name(diagnostic.stem + ".diagnostic" + diagnostic.suffix))
+        LOG.warning("Diagnostic scope: separate database %s", cfg["database"])
     if args.list_headends:
         print(f"{len(cfg['headends'])} headends; jumphost={cfg['jumphost']}; DNS={cfg['dns_server']}")
         for headend in cfg["headends"]:
             print(f"{headend['name']}\t{headend.get('mac', '')}\t{headend.get('label', '')}")
         return 0
+    if cfg["headend_auth"] == "keyring":
+        from password_auth import get_password
+        # Validate once before polling; cached secrets stay only in process memory.
+        for headend in cfg["headends"]:
+            get_password(cfg["credential_service"], headend.get("ssh_user") or cfg["ssh_user"], headend["ssh_host"])
     with collector_lock(cfg["database"]):
         db = open_database(cfg["database"])
         try:

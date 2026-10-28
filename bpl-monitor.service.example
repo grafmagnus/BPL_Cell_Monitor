@@ -4,6 +4,9 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
+# Password mode requires a native credential store reachable and unlocked
+# for this user in the service context (not automatically present on Linux).
+# Otherwise use headend_auth=key until a suitable session/store is configured.
 Type=simple
 User=bplmon
 WorkingDirectory=/opt/bpl-monitor

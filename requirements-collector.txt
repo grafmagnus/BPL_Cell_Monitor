@@ -1,3 +1,4 @@
 dnspython>=2.6,<3
 paramiko>=3.5,<5
 keyring>=25,<26
+cryptography>=44,<51

@@ -1,4 +1,4 @@
-"""Native credential storage and password SSH over an OpenSSH jump tunnel.
+"""Protected credential storage and password SSH over an OpenSSH jump tunnel.
 
 Secrets never appear in argv, environment variables, config, logs or SQLite.
 """
@@ -134,6 +134,25 @@ def get_password(service, username, hostname):
     return password
 
 
+@lru_cache(maxsize=2048)
+def _file_password(vault, keyfile, service, username, hostname):
+    from encrypted_store import EncryptedFileBackend
+    backend = EncryptedFileBackend(vault, keyfile)
+    password = backend.get_password(service, account(username, hostname))
+    if password is None:
+        password = backend.get_password(service, account(username))
+    if not password:
+        raise RuntimeError(f"No headend password stored for {username}@{hostname}; run credentials.py set")
+    return password
+
+
+def configured_password(cfg, username, hostname):
+    if cfg.get("credential_storage", "native") == "encrypted-file":
+        return _file_password(cfg["credential_file"], cfg["credential_key_file"],
+                              cfg["credential_service"], username, hostname)
+    return get_password(cfg["credential_service"], username, hostname)
+
+
 def effective_config(destination, cfg, resolved_ip, username):
     from monitor import ssh_command
     command = ssh_command(destination, cfg, resolved_ip, username)
@@ -177,7 +196,7 @@ def password_ssh_output(destination, cfg, resolved_ip, username):
         import paramiko
     except ImportError:
         raise RuntimeError("Password SSH requires: python -m pip install -r requirements-collector.txt") from None
-    password = get_password(cfg["credential_service"], username, destination)
+    password = configured_password(cfg, username, destination)
     settings = effective_config(destination, cfg, resolved_ip, username)
     client, sock, channel, timer = paramiko.SSHClient(), None, None, None
     deadline = time.monotonic() + cfg["timeout_seconds"]

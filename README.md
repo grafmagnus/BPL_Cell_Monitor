@@ -1,56 +1,63 @@
 # BPL Headend Monitor
 
-Python 3.11 oder neuer und der OpenSSH-Client. Der Collector verwendet `dnspython` sowie für gespeicherte Passwörter `keyring` und `paramiko` (`requirements-collector.txt`). Streamlit, Plotly und Pandas werden nur für das Dashboard benötigt. `requirements.txt` installiert alles zusammen. Es werden keine Geräte verändert; abgefragt wird ausschließlich `ppcdinfo unittable`.
+Python 3.11 oder neuer und der OpenSSH-Client. Der Collector verwendet `dnspython` sowie für gespeicherte Passwörter `cryptography`, `keyring` und `paramiko` (`requirements-collector.txt`). Streamlit, Plotly und Pandas werden nur für das Dashboard benötigt. `requirements.txt` installiert alles zusammen. Es werden keine Geräte verändert; abgefragt wird ausschließlich `ppcdinfo unittable`.
 
-## Headend-Passwort geschützt speichern
+## Gemeinsames HE-Passwort ohne Betriebssystem-Schlüsselbund
 
-Das neue Konfigurationsbeispiel enthält:
+Bei `No supported native credential store` ist im aktuellen Benutzer-/Dienstkontext kein unterstützter nativer Speicher verfügbar. Die neue Version bietet dafür eine ausdrücklich gewählte **verschlüsselte Datei**, ohne Desktop-Schlüsselbund. Alle HE verwenden standardmäßig dasselbe Passwort (`root@*`).
+
+In der eigenen `config.json` diese Werte ergänzen oder ersetzen, alle anderen Einstellungen beibehalten:
 
 ```json
-"headend_auth": "keyring",
+"headend_auth": "password",
+"credential_storage": "encrypted-file",
 "credential_service": "bpl-monitor/headends",
-"ssh_user": "root"
+"credential_file": "data/headend-credentials.enc",
+"credential_key_file": "secrets/headends.key"
 ```
 
-Diese Werte auch in eine bereits vorhandene `config.json` übernehmen. Ohne `headend_auth` bleibt aus Kompatibilitätsgründen die bisherige Schlüsselanmeldung aktiv (`"headend_auth": "key"`). Keine Felder `password` oder `headend_password` in die Konfiguration eintragen; diese werden abgelehnt.
+Das neue `config.example.json` enthält diese Vorgaben bereits. Relative Pfade gelten relativ zur Konfigurationsdatei. Der Schlüsselpfad kann auf ein anderes, geschütztes Verzeichnis außerhalb des Programmpakets zeigen, etwa einen ausschließlich für das Dienstkonto zugänglichen Ort. Passwortdatei und Schlüssel dürfen nicht dieselbe Datei sein.
 
-Nach Installation der Pakete einmalig **im interaktiven Terminal unter demselben Betriebssystemkonto wie der Collector** ausführen:
+Im entpackten, aktualisierten Projektverzeichnis:
 
 ```text
 python -m pip install -r requirements-collector.txt
 python credentials.py set --config config.json
 ```
 
-Das Passwort wird zweimal verdeckt abgefragt. Der Eintrag `root@*` gilt für alle Headends. Ein abweichendes Passwort nur für ein bestimmtes Gerät:
+Das gemeinsame Passwort wird zweimal verdeckt abgefragt. Beim ersten Speichern wird ein zufälliger Schlüssel automatisch erzeugt; vorhandenem Schlüssel wird nichts überschrieben. Gespeichert werden ausschließlich der Schlüssel und ein authentifiziert verschlüsselter Fernet-Datensatz. Das HE-Passwort steht weder in JSON-Konfiguration, SQLite, CSV, Prozessargumenten, Umgebungsvariablen noch Protokollen. Entschlüsseltes Passwort und Schlüssel befinden sich während des Betriebs notwendigerweise im Arbeitsspeicher.
 
-```text
-python credentials.py set --config config.json --headend 00251805c198.eui
-```
+**Schutz und Sicherung:** Unter Linux/macOS erhalten neu erzeugte Dateien Modus `0600`, neue Speicherverzeichnisse nach Möglichkeit `0700`. Zu offene POSIX-Dateirechte werden beim Lesen abgelehnt. Unter Windows werden neue Dateien vor dem Schreiben über `icacls` auf den aktuellen Benutzer eingeschränkt; gelingt das nicht, bricht die Einrichtung ab. Bei manuell kopierten/importierten Windows-Dateien deren Zugriffsrechte selbst prüfen. Das Dienstkonto benötigt Lesezugriff auf beide Dateien. Wer **Passwortdatei und Schlüssel** lesen kann, kann das Passwort entschlüsseln. Die getrennten Pfade schützen nicht vor einem kompromittierten Konto mit Zugriff auf beide Dateien. Den Schlüssel außerhalb freigegebener Projektverzeichnisse und getrennt von normalen Datenbank-/Programmpaket-Backups sichern. Ohne den passenden Schlüssel ist die Passwortdatei nicht wiederherstellbar. Eine fehlende Schlüsseldatei bei vorhandener Passwortdatei wird nicht automatisch ersetzt; falsche Schlüssel oder manipulierte Dateien führen zu einem Fehler.
 
-Der spezifische Eintrag `root@00251805c198.eui` hat Vorrang vor dem gemeinsamen Passwort. `--username` erlaubt einen anderen Kontonamen, der auch mit dem verwendeten `ssh_user` übereinstimmen muss. Ein gesetztes gerätespezifisches Passwort wird bei einem Anmeldefehler nicht durch einen Versuch mit dem gemeinsamen Passwort ersetzt.
-
-Prüfen, ohne das Passwort anzuzeigen:
+Einträge prüfen, ohne das Passwort anzuzeigen:
 
 ```text
 python credentials.py status --config config.json
-python credentials.py status --config config.json --headend 00251805c198.eui
 ```
 
-Ändern: denselben `set`-Befehl erneut ausführen und den Collector neu starten. Entfernen: `python credentials.py delete --config config.json`, gegebenenfalls mit `--headend`. `status` prüft den exakt bezeichneten Eintrag, nicht dessen Fallback. Der laufende Collector hält geladene Passwörter im Arbeitsspeicher; Änderungen am Speicher werden nach Neustart geladen.
+Ändern: denselben `set`-Befehl erneut ausführen und den Collector neu starten. Entfernen: `python credentials.py delete --config config.json`. Die Schlüsseldatei bleibt beim Löschen erhalten. Parallele Schreibvorgänge werden gesperrt; die verschlüsselte Passwortdatei wird atomar ersetzt. Passwörter werden während der Collector-Laufzeit im Speicher zwischengespeichert; Änderungen werden nach Neustart geladen.
 
-Unterstützt sind native Windows-Anmeldeinformationen, macOS-Schlüsselbund und die Linux-Backends Secret Service/KWallet. Drittanbieter-, Datei-Klartext- und leere Fallback-Backends werden abgelehnt. Das Passwort wird weder in JSON, SQLite, CSV noch in Kommandozeilen oder Umgebungsvariablen abgelegt. Die konkrete Verschlüsselung und Zugriffssteuerung übernimmt der Betriebssystemspeicher. Unter Linux muss der verwendete Schlüsselbund entsprechend geschützt eingerichtet und entsperrt sein. Ein gesperrter oder fehlender Speicher führt zu einer Fehlermeldung, nicht zu einer unsicheren Ersatzdatei. Prozesse mit denselben Kontorechten können je nach System und Schlüsselbundberechtigungen ebenfalls Zugriff erhalten.
-
-**Dauerbetrieb:** Windows-Aufgabenplanung und Collector müssen unter dem Konto laufen, in dessen Anmeldeinformationsspeicher das Passwort abgelegt wurde. Unter Linux benötigt ein Secret-Service-/KWallet-Speicher eine erreichbare Benutzersitzung, häufig einschließlich D-Bus und entsperrtem Schlüsselbund. Ein reiner systemd-Systemdienst unter `bplmon` hat diese Voraussetzungen nicht automatisch. Das Dienstbeispiel daher nur nutzen, wenn der native Speicher im Dienstkontext eingerichtet und erreichbar ist; andernfalls weiter Schlüsselanmeldung verwenden oder zunächst einen passenden Betriebssystemspeicher bereitstellen. Das Passwort wird nicht mit dem ZIP ausgeliefert und muss auf jedem Zielsystem unter dem richtigen Benutzer eingerichtet werden.
-
-**SSH-Verbindung:** In `keyring`-Betriebsart authentifiziert Paramiko ausschließlich den Headend per Passwort. Zum Jumphost öffnet der native OpenSSH-Client den Tunnel mit den bisherigen SSH-Konfigurations- und Schlüssel-/Agent-Einstellungen. Ein zusätzliches Jumphost-Passwort wird damit nicht gespeichert. Zielport, HostKeyAlias und bekannte Hostschlüssel werden aus `ssh -G` und den konfigurierten `known_hosts`-Dateien übernommen. Unbekannte oder geänderte Hostschlüssel werden abgelehnt. Eigene ProxyCommand-Skripte, Hostzertifikate und spezielle OpenSSH-Authentifizierungs-/Algorithmusvorgaben werden vom Passworttransport nicht vollständig nachgebildet; vorgesehen sind der normale ProxyJump-Pfad und bekannte Standard-Hostschlüssel. SSH-Kommandos und Fehlertexte im Passwortpfad enthalten keine Bibliotheks-Fehlerdetails, die versehentlich Geheimnisse offenlegen könnten.
-
-Einzeltest nach der Einrichtung:
+Anschließend ein HE prüfen:
 
 ```text
 python monitor.py --config config.json --headend 00251805c198.eui --once
 ```
 
-Referenzen: [native Speicher und API von keyring](https://keyring.readthedocs.io/en/latest/) sowie [Paramiko-Passwortanmeldung und Hostschlüsselprüfung](https://docs.paramiko.org/en/stable/api/client.html).
+Danach den normalen Collector ohne `--headend` starten. In der Aufgabenplanung oder im Dienst dasselbe Konto verwenden, das Zugriff auf die beiden Dateien besitzt. Für `encrypted-file` sind weder D-Bus noch ein entsperrter Desktop-Schlüsselbund erforderlich. Das Paket enthält keine echten Passwörter oder Schlüssel; Einrichtung und Sicherung erfolgen auf dem Zielsystem.
+
+### Optional: nativer Betriebssystemspeicher
+
+Mit `"credential_storage": "native"` bleibt der bisherige Passwortspeicher verfügbar: Windows-Anmeldeinformationen, macOS-Schlüsselbund oder Linux Secret Service/KWallet. Drittanbieter-/Klartext-Fallbacks werden weiterhin abgelehnt. Linux-Dienste brauchen dafür einen erreichbaren und entsperrten nativen Schlüsselbund; ohne diesen explizit `encrypted-file` wählen. Es gibt keinen stillen Wechsel zwischen den Speicherarten und keine automatische Migration vorhandener Passwörter. Nach einem Wechsel den `set`-Befehl für die gewählte Speicherart ausführen.
+
+`"headend_auth": "keyring"` bleibt als älterer Name für die Passwortanmeldung kompatibel. `"headend_auth": "key"` verwendet weiter den ursprünglichen OpenSSH-Schlüsseltransport und liest kein HE-Passwort. Ohne das Feld bleibt diese Schlüsselanmeldung der Kompatibilitätsstandard. Klartextfelder `password` und `headend_password` werden weiterhin abgelehnt.
+
+### Gerätespezifische Ausnahmen und SSH-Verbindung
+
+Ohne `--headend` gilt das Passwort für alle HE. Optional überschreibt `python credentials.py set --config config.json --headend 00251805c198.eui` den gemeinsamen Eintrag für dieses Gerät. Ein spezifischer Eintrag hat Vorrang; bei Anmeldefehlern wird kein weiteres Passwort ausprobiert. `--username` erlaubt einen anderen Kontonamen, der zum verwendeten `ssh_user` passen muss. `status` und `delete` mit `--headend` beziehen sich nur auf den exakt bezeichneten Eintrag.
+
+Im Passwortbetrieb authentifiziert Paramiko ausschließlich den Headend per Passwort. Der native OpenSSH-Client öffnet den Jumphost-Tunnel mit der bestehenden SSH-Konfiguration und Schlüssel-/Agent-Anmeldung. Ein zusätzliches Jumphost-Passwort wird nicht gespeichert. Zielport, HostKeyAlias und bekannte Hostschlüssel kommen aus `ssh -G` und den konfigurierten `known_hosts`-Dateien. Unbekannte oder geänderte Hostschlüssel werden abgelehnt. Eigene ProxyCommand-Skripte, Hostzertifikate und spezielle OpenSSH-Authentifizierungs-/Algorithmusvorgaben werden nicht vollständig nachgebildet; vorgesehen sind der normale ProxyJump-Pfad und bekannte Standard-Hostschlüssel. Fehlertexte des Passworttransports enthalten keine Bibliotheksdetails, die Geheimnisse offenlegen könnten.
+
+Referenzen: [Fernet-Verschlüsselung und Schlüsselverwaltung](https://cryptography.io/en/latest/fernet/), [native Speicher von keyring](https://keyring.readthedocs.io/en/latest/) und [Paramiko-Passwortanmeldung und Hostschlüsselprüfung](https://docs.paramiko.org/en/stable/api/client.html).
 
 ## Headends aus CSV, DNS und Jumphost
 
@@ -203,8 +210,11 @@ Alle relativen Datenpfade werden relativ zur JSON-Konfiguration aufgelöst, nich
 | `headends_csv` | im Beispiel `headends.csv` | Semikolon-Export; ausschließlich HE-Zeilen, alternativ zur manuellen Liste |
 | `jumphost` | `NMS3_Infra` | SSH-Jump-Alias; `null` verwendet die SSH-Konfiguration |
 | `ssh_user` | `root` | Zielbenutzer für die HE aus der CSV |
-| `headend_auth` | `key`; Beispiel `keyring` | OpenSSH-Schlüsselanmeldung oder Passwort aus dem nativen Betriebssystemspeicher |
-| `credential_service` | `bpl-monitor/headends` | Namensraum im Betriebssystemspeicher, kein Passwort |
+| `headend_auth` | `key`; Beispiel `password` | OpenSSH-Schlüsselanmeldung oder Passworttransport; `keyring` bleibt als Alias kompatibel |
+| `credential_service` | `bpl-monitor/headends` | Namensraum im gewählten Speicher, kein Passwort |
+| `credential_storage` | `native`; Beispiel `encrypted-file` | Nativer Schlüsselbund oder verschlüsselte Datei |
+| `credential_file` | `data/headend-credentials.enc` | Authentifiziert verschlüsselte Passwortdatei |
+| `credential_key_file` | `secrets/headends.key` | Getrennte, zu schützende Schlüsseldatei |
 | `dns_server` | `10.40.8.117` | Ausschließlich verwendeter DNS-Server bei DNS-Zielen |
 | `dns_port` | 53 | DNS-Port |
 | `dns_timeout_seconds` | 5 | DNS-Gesamtzeitlimit je Versuch, zusätzlich zum SSH-Zeitlimit |
@@ -265,12 +275,12 @@ python -m unittest -v test_monitor.py
 Nach Installation der Dashboardpakete:
 
 ```text
-python -m unittest -v test_monitor.py test_analytics.py test_dashboard.py test_discovery.py test_password_auth.py
+python -m unittest -v test_monitor.py test_analytics.py test_dashboard.py test_discovery.py test_password_auth.py test_encrypted_store.py
 ```
 
-Validiert mit Python 3.11, Streamlit 1.66.1, Plotly 6.9.0 und Pandas 2.3.3 sowie Paramiko 4.0.0 und keyring 25.7.0: 53 Tests erfolgreich. `requirements-tested.txt` hält zusätzlich die vollständigen Paketversionen dieses Testlaufs fest; für die gleiche Umgebung kann es statt `requirements.txt` installiert werden. Die Streamlit-Tests prüfen die Ausführung und Widgets; ein browserseitiger Kachelabruf ist darin nicht enthalten.
+Validiert mit Python 3.11, Streamlit 1.66.1, Plotly 6.9.0 und Pandas 2.3.3 sowie Paramiko 4.0.0 und keyring 25.7.0: 64 Tests erfolgreich. `requirements-tested.txt` hält zusätzlich die vollständigen Paketversionen dieses Testlaufs fest; für die gleiche Umgebung kann es statt `requirements.txt` installiert werden. Die Streamlit-Tests prüfen die Ausführung und Widgets; ein browserseitiger Kachelabruf ist darin nicht enthalten.
 
-Die Tests verwenden temporäre Datenbanken und synthetische SSH-Ergebnisse. DNS und entfernte Headends werden simuliert; die Passwortanmeldung wird zusätzlich mit einem echten lokalen SSH-Handshake über ein Socketpaar und einen generierten Hostschlüssel geprüft. Der echte Betriebssystem-Passwortspeicher wird in den Tests nicht beschrieben; ein echter Netztest ist mit `--once` in der Zielumgebung nötig. Es werden keine Passwörter in der JSON-Datei gespeichert.
+Die Tests verwenden temporäre Datenbanken und synthetische SSH-Ergebnisse. DNS und entfernte Headends werden simuliert; die Passwortanmeldung wird zusätzlich mit einem echten lokalen SSH-Handshake über ein Socketpaar und einen generierten Hostschlüssel geprüft. Die verschlüsselte Datei wird mit synthetischen Passwörtern einschließlich Manipulations-/Schlüsselverlustprüfung und Dateirechten getestet. Der echte Betriebssystem-Passwortspeicher wird in den Tests nicht beschrieben; ein echter Netztest ist mit `--once` in der Zielumgebung nötig. Es werden keine Passwörter in der JSON-Datei gespeichert.
 
 ## Referenzen
 

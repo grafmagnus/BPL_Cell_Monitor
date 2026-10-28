@@ -98,8 +98,16 @@ def load_config(path):
     cfg.setdefault("ssh_user", "root")
     cfg.setdefault("headend_auth", "key")
     cfg.setdefault("credential_service", "bpl-monitor/headends")
-    if cfg["headend_auth"] not in ("key", "keyring"):
-        raise ValueError("headend_auth must be key or keyring")
+    if cfg["headend_auth"] not in ("key", "keyring", "password"):
+        raise ValueError("headend_auth must be key, password or keyring")
+    cfg.setdefault("credential_storage", "native")
+    if cfg["credential_storage"] not in ("native", "encrypted-file"):
+        raise ValueError("credential_storage must be native or encrypted-file")
+    for key, default in (("credential_file", "data/headend-credentials.enc"),
+                         ("credential_key_file", "secrets/headends.key")):
+        cfg[key] = str((path.parent / cfg.get(key, default)).resolve())
+    if cfg["credential_file"] == cfg["credential_key_file"]:
+        raise ValueError("credential_file and credential_key_file must differ")
     if not isinstance(cfg["credential_service"], str) or not 1 <= len(cfg["credential_service"]) <= 200:
         raise ValueError("Invalid credential_service")
     if "password" in cfg or "headend_password" in cfg:
@@ -297,7 +305,7 @@ def ssh_command(destination, cfg, resolved_ip=None, ssh_user=None):
 
 
 def ssh_output(destination, cfg, resolved_ip=None, ssh_user=None):
-    if cfg.get("headend_auth") == "keyring":
+    if cfg.get("headend_auth") in ("keyring", "password"):
         from password_auth import password_ssh_output
         return password_ssh_output(destination, cfg, resolved_ip, ssh_user or cfg["ssh_user"])
     command = ssh_command(destination, cfg, resolved_ip, ssh_user)
@@ -448,11 +456,11 @@ def main():
         for headend in cfg["headends"]:
             print(f"{headend['name']}\t{headend.get('mac', '')}\t{headend.get('label', '')}")
         return 0
-    if cfg["headend_auth"] == "keyring":
-        from password_auth import get_password
+    if cfg["headend_auth"] in ("keyring", "password"):
+        from password_auth import configured_password
         # Validate once before polling; cached secrets stay only in process memory.
         for headend in cfg["headends"]:
-            get_password(cfg["credential_service"], headend.get("ssh_user") or cfg["ssh_user"], headend["ssh_host"])
+            configured_password(cfg, headend.get("ssh_user") or cfg["ssh_user"], headend["ssh_host"])
     with collector_lock(cfg["database"]):
         db = open_database(cfg["database"])
         try:

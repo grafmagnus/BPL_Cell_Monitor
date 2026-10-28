@@ -5,3 +5,5 @@ __pycache__/
 config.json
 coordinates.csv
 demo-data/
+secrets/
+*.enc

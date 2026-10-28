@@ -164,6 +164,17 @@ class PasswordTests(unittest.TestCase):
             credentials.main()
         backend.set_password.assert_not_called()
 
+    def test_native_save_errors_do_not_disclose_password(self):
+        backend = Mock()
+        backend.set_password.side_effect = RuntimeError("SYNTHETIC-PRIVATE")
+        cfg = dict(self.cfg, headends=[{"ssh_host": "he"}])
+        with patch("sys.argv", ["credentials.py", "set"]), patch("credentials.load_config", return_value=cfg), patch(
+                "credentials.secure_backend", return_value=backend), patch(
+                "sys.stdin.isatty", return_value=True), patch(
+                "credentials.getpass.getpass", side_effect=["SYNTHETIC-PRIVATE", "SYNTHETIC-PRIVATE"]), self.assertRaises(RuntimeError) as error:
+            credentials.main()
+        self.assertNotIn("SYNTHETIC-PRIVATE", str(error.exception))
+
     def test_real_ssh_password_handshake_and_command_over_local_socket_pair(self):
         # Real Paramiko SSH handshake with a generated host key, no network hosts
         # and no access to the user's actual credential store.

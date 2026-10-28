@@ -1,11 +1,11 @@
-"""Set/delete/check native credentials. Passwords are accepted only at a hidden prompt."""
+"""Set/delete/check protected credentials. Passwords are accepted only at a hidden prompt."""
 import argparse
 import getpass
 import sys
 import warnings
 
 from monitor import load_config
-from password_auth import account, get_password, secure_backend
+from password_auth import account, get_password, _file_password, secure_backend
 
 
 def main():
@@ -20,7 +20,12 @@ def main():
     hostname = args.headend.lower() if args.headend else None
     if hostname and hostname not in {h["ssh_host"].lower() for h in cfg["headends"]}:
         parser.error("Unknown headend hostname")
-    backend = secure_backend()
+    storage = cfg.get("credential_storage", "native")
+    if storage == "encrypted-file":
+        from encrypted_store import EncryptedFileBackend
+        backend = EncryptedFileBackend(cfg["credential_file"], cfg["credential_key_file"])
+    else:
+        backend = secure_backend()
     service, name = cfg["credential_service"], account(username, hostname)
     if args.action == "set":
         if not sys.stdin.isatty():
@@ -33,21 +38,31 @@ def main():
             raise RuntimeError("Passwords are empty or do not match; nothing stored")
         try:
             backend.set_password(service, name, password)
-        except Exception:
+        except RuntimeError:
+            if storage == "encrypted-file":
+                raise
             raise RuntimeError("Native credential store could not save the password") from None
+        except Exception:
+            raise RuntimeError("Credential store could not save the password; check file paths and permissions") from None
         get_password.cache_clear()
-        print(f"Stored in native credential store: {service} / {name}")
+        _file_password.cache_clear()
+        print(f"Stored in {storage} credential store: {service} / {name}")
     else:
         try:
             if args.action == "delete":
                 backend.delete_password(service, name)
                 get_password.cache_clear()
+                _file_password.cache_clear()
                 print("Credential deleted")
             else:
                 present = backend.get_password(service, name) is not None
                 print(f"{service} / {name}: {'present' if present else 'not set'}")
-        except Exception:
+        except RuntimeError:
+            if storage == "encrypted-file":
+                raise
             raise RuntimeError("Native credential operation failed") from None
+        except Exception:
+            raise RuntimeError("Credential operation failed; check storage paths and permissions") from None
     return 0
 
 
